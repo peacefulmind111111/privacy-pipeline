@@ -3,8 +3,7 @@
 from .config import ExperimentConfig, current_timestamp, save_results_json
 from .data import get_cifar10_dataloaders
 from .models import resnet20
-from .training import train_dp_sgd, train_dp_mixup
-from .lasso import dp_lasso
+from .training import train_dp_sgd
 
 __all__ = [
     "ExperimentConfig",
@@ -13,6 +12,4 @@ __all__ = [
     "get_cifar10_dataloaders",
     "resnet20",
     "train_dp_sgd",
-    "train_dp_mixup",
-    "dp_lasso",
 ]

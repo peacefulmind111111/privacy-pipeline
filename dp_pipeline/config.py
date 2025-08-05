@@ -23,8 +23,6 @@ class ExperimentConfig:
     noise_multiplier: float = 1.0
     delta: float = 1e-5
     sample_rate: float | None = None
-    mixup_alpha: float | None = None
-    lasso_alpha: float = 0.01
     comments: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
