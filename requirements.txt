@@ -1,0 +1,14 @@
+# Core ML and DP packages
+torch==2.7.1+cu118
+torchvision==0.22.1+cu118
+opacus==1.4.0
+
+# Machine-learning utilities
+scikit-learn==1.5.0
+pandas==2.2.2
+
+# Web application
+streamlit==1.33.0
+
+# Notebook kernel support (needed for registering the environment as a Jupyter kernel)
+ipykernel==6.29.4
