@@ -5,7 +5,7 @@
 #  (2025-07-10 bug-fixed & instrumented edition)
 # ===============================================================
 
-import os, random, warnings, time
+import os, random, warnings, time, json
 from itertools import cycle
 from collections import defaultdict
 import sys, torch, matplotlib.pyplot as plt
@@ -59,6 +59,14 @@ DATA_FRACTION, SELF_AUG_FACTOR = 0.2, 1
 DEVICE                      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 α_SCALE = PUB_BATCH / (PRIV_BATCH + PUB_BATCH)   # factor for mix-subtract
+
+def apply_params(params: dict | None) -> None:
+    """Override global hyperparameters using ``params``."""
+    if not params:
+        return
+    for k, v in params.items():
+        if k in globals():
+            globals()[k] = v
 
 # ------------------------------------------------------------------
 # 2.  RNG
@@ -429,7 +437,7 @@ def train_central(use_public: bool):
                       f"acc={acc:5.2f}%  ε={accnt.get_epsilon(DELTA):.2f}")
 
         sched.step()
-    summary(model, accnt, log, "central_" + ("pub" if use_public else "priv"))
+    return summary(model, accnt, log, "central_" + ("pub" if use_public else "priv"))
 
 # ------------------------------------------------------------------
 # 8-B. Helper for LOCAL DP-SGD
@@ -522,7 +530,7 @@ def train_local(use_public: bool):
 
         dummy_sched.step()
 
-    summary(model, accnt, log, "local_" + ("pub" if use_public else "priv"))
+    return summary(model, accnt, log, "local_" + ("pub" if use_public else "priv"))
 
 # ------------------------------------------------------------------
 # 8-C. DP-SCAFFOLD
@@ -634,82 +642,83 @@ def train_scaffold(use_public: bool):
 
         sched.step()
 
-    summary(model, accnt, log, "scaffold_" + ("pub" if use_public else "priv"))
+    return summary(model, accnt, log, "scaffold_" + ("pub" if use_public else "priv"))
 
 # ------------------------------------------------------------------
 # 9.  Summary + plots
 # ------------------------------------------------------------------
-def summary(model, accnt, log, name):
-    print(f"\n{name}: final acc={accuracy(model):.2f}%  "
-          f"ε={accnt.get_epsilon(DELTA):.2f}")
-    plot_curves(log, f" ({name}, {PUBLIC_METHOD})")
+def summary(model, accnt, log, name, plot: bool = False):
+    """Return metrics for ``model``.
 
-# ------------------------------------------------------------------
-# 10.  Dispatcher
-# ------------------------------------------------------------------
+    Parameters
+    ----------
+    model : nn.Module
+        Trained model.
+    accnt : RDPAccountant
+        Accountant tracking privacy loss.
+    log : Dict
+        Training log containing losses and accuracy measurements.
+    name : str
+        Experiment name.
+    plot : bool, optional
+        If ``True`` generate diagnostic plots.
+    """
+    final_acc = accuracy(model)
+    eps = accnt.get_epsilon(DELTA)
+    if plot:
+        plot_curves(log, f" ({name}, {PUBLIC_METHOD})")
+    history = [
+        {"step": s, "accuracy": a}
+        for s, a in zip(log.get("acc_step", []), log.get("acc", []))
+    ]
+    return {
+        "final_accuracy": float(final_acc),
+        "epsilon": float(eps),
+        "history": history,
+    }
+
+def run_experiment(
+    experiment: str = EXPERIMENT,
+    params: dict | None = None,
+    output_path: str | None = None,
+):
+    """Run one of the DP-SGD experiments and optionally save metrics."""
+    apply_params(params)
+
+    if   experiment == "central_priv":
+        res = train_central(False)
+    elif experiment == "central_pub":
+        res = train_central(True)
+    elif experiment == "local_priv":
+        res = train_local(False)
+    elif experiment == "local_pub":
+        res = train_local(True)
+    elif experiment == "scaffold_priv":
+        res = train_scaffold(False)
+    elif experiment == "scaffold_pub":
+        res = train_scaffold(True)
+    else:
+        raise ValueError("Unknown EXPERIMENT")
+
+    results = {
+        "experiment_name": experiment,
+        "hyperparameters": params or {},
+        "history": res["history"],
+        "final_metrics": {
+            "accuracy": res["final_accuracy"],
+            "epsilon": res["epsilon"],
+        },
+    }
+
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+    return results
+
+
 if __name__ == "__main__":
-    print(f"Experiment: {EXPERIMENT} • PUBLIC_METHOD={PUBLIC_METHOD} "
-          f"• DEBUG={'on' if DEBUG else 'off'}")
-    print(f"Private data : {N_PRIVATE} CIFAR‑10 images")
-    print(f"Public batch : {PUB_BATCH} synthetic samples\n")
-
-    SAMPLES_PER_CLASS = int(os.getenv("N_SHOW", "8"))   # one row length
-
-    # -----------------------------------------------------------
-    # helper to un-normalise tensors back to RGB [0,1]
-    # -----------------------------------------------------------
-    def denorm(batch, mean=mean, std=std):
-        m = torch.tensor(mean, device=batch.device).view(3, 1, 1)
-        s = torch.tensor(std , device=batch.device).view(3, 1, 1)
-        return (batch * s + m).clamp(0, 1)
-
-    # -----------------------------------------------------------
-    # collect synthetic samples from the diffusion buffer
-    # -----------------------------------------------------------
-    synth_by_class = {c: [] for c in range(10)}
-    with torch.no_grad():
-        while min(len(v) for v in synth_by_class.values()) < SAMPLES_PER_CLASS:
-            Xs, ys = next(train_pub)        # iterator already on DEVICE
-            for x, y in zip(Xs, ys):
-                if len(synth_by_class[int(y)]) < SAMPLES_PER_CLASS:
-                    synth_by_class[int(y)].append(x.cpu())
-
-    # -----------------------------------------------------------
-    # collect real CIFAR-10 test images
-    # -----------------------------------------------------------
-    real_by_class = {c: [] for c in range(10)}
-    for img, lab in test_set:
-        if len(real_by_class[lab]) < SAMPLES_PER_CLASS:
-            real_by_class[lab].append(img)
-        if min(len(v) for v in real_by_class.values()) == SAMPLES_PER_CLASS:
-            break
-
-    # -----------------------------------------------------------
-    # visualise
-    # -----------------------------------------------------------
-    def show_grid(by_class_dict, title):
-        rows = []
-        for c in range(10):
-            row = torch.stack(by_class_dict[c], 0)           # (N,3,32,32)
-            rows.append(denorm(row))
-        grid = make_grid(torch.cat(rows, 0),
-                         nrow=SAMPLES_PER_CLASS,
-                         padding=2).permute(1, 2, 0).numpy()
-        plt.figure(figsize=(SAMPLES_PER_CLASS, 10))
-        plt.imshow(grid)
-        plt.axis("off")
-        plt.title(title, fontsize=14)
-        plt.show()
-
-    show_grid(real_by_class,   "REAL CIFAR-10 (test set)")
-    show_grid(synth_by_class,  "SYNTHETIC (Consistency-Decoder)")
-
-
-    if   EXPERIMENT == "central_priv":   train_central(False)
-    elif EXPERIMENT == "central_pub":    train_central(True)
-    elif EXPERIMENT == "local_priv":     train_local(False)
-    elif EXPERIMENT == "local_pub":      train_local(True)
-    elif EXPERIMENT == "scaffold_priv":  train_scaffold(False)
-    elif EXPERIMENT == "scaffold_pub":   train_scaffold(True)
-    else: raise ValueError("Unknown EXPERIMENT")
+    output = os.getenv("OUTPUT", os.path.join("outputs", "local_dpsgd.json"))
+    res = run_experiment(EXPERIMENT, output_path=output)
+    print(json.dumps(res, indent=2))
 

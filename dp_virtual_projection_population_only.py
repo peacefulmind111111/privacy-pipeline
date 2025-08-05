@@ -2,7 +2,7 @@
 # Filename: dp_virtual_projection_population_only.py
 # (2025-07-03 patched version)
 ##############################################################
-import os, psutil, random, math, time, statistics
+import os, psutil, random, math, time, statistics, json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,6 +51,14 @@ virtual_augment_factor = 10
 c_start = 1e9;  c_end = 1e9
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def apply_params(params: dict | None) -> None:
+    """Override module-level hyperparameters with ``params``."""
+    if not params:
+        return
+    for k, v in params.items():
+        if k in globals():
+            globals()[k] = v
 
 ###############################################################################
 # 0.1 Memory helper
@@ -394,76 +402,86 @@ def run_training(dp_net,
 ###############################################################################
 # 10-B. main_run
 ###############################################################################
-def main_run():
+def main_run(params: dict | None = None, output_path: str | None = None):
+    """Run the virtual projection experiment.
+
+    Parameters
+    ----------
+    params: dict, optional
+        Hyperparameters to override at runtime.
+    output_path: str, optional
+        Where to save a JSON report of metrics. If ``None`` the report is
+        returned but not written to disk.
+    """
+    apply_params(params)
     print_memory_usage("Start")
 
     # A) build virtual subsets
-    v_subsets = build_virtual_subsets(train_ds,subsets_per_class,subset_size,
-                                      virtual_augment_factor)
+    v_subsets = build_virtual_subsets(
+        train_ds, subsets_per_class, subset_size, virtual_augment_factor
+    )
     print(f"Built {len(v_subsets)} virtual subsets.")
 
     # B) compute e_i for every virtual subset
     base_net = ResNet20().to(device).eval()
-    e_list = [compute_fullmodel_grad_for_subset(base_net,idxs,train_ds)
-              for idxs,_ in v_subsets]
+    e_list = [compute_fullmodel_grad_for_subset(base_net, idxs, train_ds)
+              for idxs, _ in v_subsets]
     e_basis = gram_schmidt(e_list)
     print(f"Orthonormal basis size = {len(e_basis)}/{len(e_list)}")
 
-    def project_onto(vec,basis):
-        out=torch.zeros_like(vec)
-        for b in basis: out += torch.dot(vec,b)*b
+    def project_onto(vec, basis):
+        out = torch.zeros_like(vec)
+        for b in basis:
+            out += torch.dot(vec, b) * b
         return out
-
 
     # ProjSGD (after warm-start)
     dp_proj = build_model().to(device)
-    opt_proj = optim.SGD(dp_proj.parameters(),lr=lr,momentum=outer_momentum,
-                         weight_decay=5e-4)
-    proj_stats = run_training(dp_proj,opt_proj,True,
-                               e_basis,project_onto,
-                               train_loader,test_loader)
+    opt_proj = optim.SGD(
+        dp_proj.parameters(), lr=lr, momentum=outer_momentum, weight_decay=5e-4
+    )
+    proj_stats = run_training(
+        dp_proj,
+        opt_proj,
+        True,
+        e_basis,
+        project_onto,
+        train_loader,
+        test_loader,
+    )
 
-    ##################################################################
-    # Visualisations
-    ##################################################################
-    epochs = range(1,num_epochs+1)
-    steps  = range(1,len(proj_stats['diff_L2'])+1)  # <<< NEW
-
-    # 0) SGD-vs-ProjSGD curves
-    plt.figure(figsize=(11,4))
-    plt.subplot(1,2,1)
-    #plt.plot(epochs,base_stats['loss'],'-o',label='SGD (p)')
-    plt.plot(epochs,proj_stats['loss'],'-o',label='ProjSGD (p′)')
-    plt.title("Training Loss per Epoch"); plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend()
-    plt.subplot(1,2,2)
-    #plt.plot(epochs,base_stats['acc'],'-o',label='SGD (p)')
-    plt.plot(epochs,proj_stats['acc'],'-o',label='ProjSGD (p′)')
-    plt.title("Test Accuracy per Epoch"); plt.xlabel("Epoch"); plt.ylabel("Accuracy (%)"); plt.legend()
-    plt.tight_layout(); plt.show()
-
-    # <<< NEW: projection diagnostics ---------------------------------------
-    plt.figure(figsize=(10,4))
-    plt.subplot(1,2,1)
-    plt.plot(steps,proj_stats['diff_L2'],color='red')
-    plt.title("‖p − p′‖₂ over Steps (Proj run)")
-    plt.xlabel("Training Step"); plt.ylabel("L2 Norm")
-    plt.subplot(1,2,2)
-    plt.plot(steps,proj_stats['cos'],color='orange')
-    plt.title("Cosine Similarity(p, p′) (Proj run)")
-    plt.xlabel("Training Step"); plt.ylabel("Cosine")
-    plt.tight_layout(); plt.show()
-    # ----------------------------------------------------------------------
-
-    # Quick stats
+    # Quick stats -----------------------------------------------------------
+    mean_diff = float(np.mean(proj_stats["diff_L2"]))
+    mean_cos = float(np.mean(proj_stats["cos"]))
+    final_acc = float(proj_stats["acc"][-1])
     print("\nPopulation-level stats (Proj run):")
-    print(f"  mean‖p − p′‖₂ = {np.mean(proj_stats['diff_L2']):.4f}")
-    print(f"  mean cos(p,p′) = {np.mean(proj_stats['cos']):.4f}")
-
+    print(f"  mean‖p − p′‖₂ = {mean_diff:.4f}")
+    print(f"  mean cos(p,p′) = {mean_cos:.4f}")
     print("\nFinal accuracy:")
-    #print(f"  SGD (p)   : {base_stats['acc'][-1]:.2f}%")
-    print(f"  ProjSGD p′: {proj_stats['acc'][-1]:.2f}%")
+    print(f"  ProjSGD p′: {final_acc:.2f}%")
+
+    history = [
+        {"epoch": i + 1, "loss": float(l), "accuracy": float(a)}
+        for i, (l, a) in enumerate(zip(proj_stats["loss"], proj_stats["acc"]))
+    ]
+    results = {
+        "experiment_name": "dp_virtual_projection",
+        "hyperparameters": params or {},
+        "history": history,
+        "final_metrics": {
+            "accuracy": final_acc,
+            "mean_diff_L2": mean_diff,
+            "mean_cos": mean_cos,
+        },
+    }
+
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+    return results
 
 ###############################################################################
 if __name__ == "__main__":
-    main_run()
+    main_run(output_path=os.path.join("outputs", "dp_virtual_projection.json"))
 
