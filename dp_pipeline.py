@@ -286,7 +286,7 @@ def train_dp_sgd(
         module=model,
         optimizer=optimizer,
         data_loader=train_loader,
-        target_epsilon=None,  # we'll use noise_multiplier instead
+        #target_epsilon=None,  # we'll use noise_multiplier instead
         target_delta=config.delta,
         epochs=config.epochs,
         max_grad_norm=config.clip_norm,
