@@ -27,6 +27,16 @@ class ExperimentLogger:
                     "clip_value": float,
                     "grad_norm": float,
                     "lr": float,
+                    "pre_clip": {
+                        "l1_norm": float,
+                        "l2_norm": float,
+                        "cosine_similarity": float,
+                    },
+                    "post_clip": {
+                        "l1_norm": float,
+                        "l2_norm": float,
+                        "cosine_similarity": float,
+                    },
                 },
                 ...
             ],
@@ -45,14 +55,15 @@ class ExperimentLogger:
 
     def save(self, final_metrics: Dict[str, Any]) -> None:
         os.makedirs(self.output_dir, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         report = {
             "experiment_name": getattr(self.cfg, "experiment_name", "dp_experiment"),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": ts,
             "hyperparameters": _ensure_serializable(asdict(self.cfg)),
             "iterations": self.iterations,
             "final_metrics": final_metrics,
         }
-        path = os.path.join(self.output_dir, "metrics.json")
+        path = os.path.join(self.output_dir, f"metrics_{ts}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
 

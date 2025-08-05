@@ -109,6 +109,17 @@ def train(cfg: ExperimentConfig, output_dir: str, plot_every: int = 5) -> Dict[s
             accountant.step(noise_multiplier=cfg.noise_mult, sample_rate=sample_rate)
             eps = accountant.get_epsilon(cfg.delta)
 
+            batch_pre = {
+                "l1_norm": float(np.mean(pre_l1)) if pre_l1 else 0.0,
+                "l2_norm": float(np.mean(pre_l2)) if pre_l2 else 0.0,
+                "cosine_similarity": float(np.mean(pre_cos)) if pre_cos else 0.0,
+            }
+            batch_post = {
+                "l1_norm": float(np.mean(post_l1)) if post_l1 else 0.0,
+                "l2_norm": float(np.mean(post_l2)) if post_l2 else 0.0,
+                "cosine_similarity": float(np.mean(post_cos)) if post_cos else 0.0,
+            }
+
             logger.log(
                 step_count,
                 {
@@ -119,6 +130,8 @@ def train(cfg: ExperimentConfig, output_dir: str, plot_every: int = 5) -> Dict[s
                     "clip_value": float(clip_val),
                     "grad_norm": float(grad_norm),
                     "lr": float(optimizer.param_groups[0]["lr"]),
+                    "pre_clip": batch_pre,
+                    "post_clip": batch_post,
                 },
             )
 
@@ -131,12 +144,16 @@ def train(cfg: ExperimentConfig, output_dir: str, plot_every: int = 5) -> Dict[s
             "loss": float(np.mean(losses)) if losses else 0.0,
             "accuracy": float(acc),
             "epsilon": float(eps),
-            "preclip_l1": _summary_stats(epoch_preclip_l1),
-            "preclip_l2": _summary_stats(epoch_preclip_l2),
-            "preclip_cos": _summary_stats(epoch_preclip_cos),
-            "postclip_l1": _summary_stats(epoch_postclip_l1),
-            "postclip_l2": _summary_stats(epoch_postclip_l2),
-            "postclip_cos": _summary_stats(epoch_postclip_cos),
+            "pre_clip": {
+                "l1_norm": _summary_stats(epoch_preclip_l1),
+                "l2_norm": _summary_stats(epoch_preclip_l2),
+                "cosine_similarity": _summary_stats(epoch_preclip_cos),
+            },
+            "post_clip": {
+                "l1_norm": _summary_stats(epoch_postclip_l1),
+                "l2_norm": _summary_stats(epoch_postclip_l2),
+                "cosine_similarity": _summary_stats(epoch_postclip_cos),
+            },
         }
         history.append(epoch_record)
 
