@@ -2,6 +2,9 @@
 torch
 torchvision
 opacus==1.4.0
+psutil
+matplotlib
+diffusers
 
 # Machine-learning utilities
 scikit-learn==1.5.0
