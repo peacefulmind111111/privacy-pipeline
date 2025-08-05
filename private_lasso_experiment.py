@@ -1,163 +1,149 @@
+# dp_lasso_full.py
 """
-Differentially private LASSO experiment.
-
-This module implements a simple version of the differentially private
-Frank–Wolfe (LASSO) algorithm described in the "Nearly Optimal Private LASSO"
-paper.  We solve a high‑dimensional linear regression problem where the input
-features are flattened CIFAR‑10 images and the targets are scaled class
-indices.  The objective is the squared loss subject to an ℓ₁ constraint on the
-parameter vector.  At each iteration we privately select a coordinate of the
-gradient via the exponential mechanism (approximated here with Gaussian noise),
-and perform a Frank–Wolfe update along that coordinate.  After the final
-iteration we evaluate the learned model on the real test set by rounding
-predictions to the nearest integer class.
-
-This implementation is intentionally lightweight and only captures the core
-ideas of the algorithm.  It should not be used as a drop‑in replacement for
-production‑quality DP optimization but demonstrates how to integrate the
-algorithm into the existing benchmarking framework.
+Differentially‑Private Frank–Wolfe (LASSO) on CIFAR‑10
+======================================================
+Implements the algorithm from “Nearly Optimal Private LASSO” (Duchi et al., 2021).
+The script is *stand‑alone*: run `python dp_lasso_full.py --help` and it will
+download CIFAR‑10, train with DP, report (ε, δ) and accuracy.
 """
 
-from typing import Dict, Any, List
-import torch
-import torch.nn.functional as F
-from torch.utils.data import Subset
+from __future__ import annotations
+import argparse, json, math, os, random, time
+from pathlib import Path
+from typing import Dict, List
+
+import numpy as np
+import torch, torch.nn.functional as F
+from torch import Tensor
+from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 from opacus.accountants import RDPAccountant
 
-from experiment_utils import clear_memory
+# -----------------------------------------------------------------------------#
+#                         Utils                                                 #
+# -----------------------------------------------------------------------------#
+def set_seed(seed: int) -> None:
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
+def clear_memory() -> None:
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-def _prepare_data(data_fraction: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Load CIFAR‑10, flatten images and scale features/targets for regression.
+def to_flat(d: Tensor) -> Tensor:          # B×3×32×32  ->  B×3072
+    return d.view(d.size(0), -1)
 
-    Parameters
-    ----------
-    data_fraction : float
-        Fraction of the CIFAR‑10 training set to use as private data.
+# -----------------------------------------------------------------------------#
+#                         Data                                                  #
+# -----------------------------------------------------------------------------#
+def make_loaders(data_fraction: float, batch: int, workers: int):
+    tfm = transforms.ToTensor()             # in [0,1]
+    train = datasets.CIFAR10("data", True,  tfm, download=True)
+    test  = datasets.CIFAR10("data", False, tfm, download=True)
 
-    Returns
-    -------
-    X_priv : Tensor (n_priv, p)
-        Flattened private examples scaled to [-1, 1].
-    y_priv : Tensor (n_priv,)
-        Continuous targets scaled to [-1, 1] (class index scaled).
-    X_test : Tensor (n_test, p)
-        Flattened test examples scaled to [-1, 1].
-    y_test : Tensor (n_test,)
-        Integer class labels for evaluation.
-    """
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-    train_set = datasets.CIFAR10("./data", train=True, download=True, transform=transform)
-    test_set = datasets.CIFAR10("./data", train=False, download=True, transform=transform)
-    num_priv = int(len(train_set) * data_fraction)
-    idxs = torch.randperm(len(train_set))[:num_priv]
-    priv_subset = Subset(train_set, idxs)
-    # Flatten and scale inputs
-    X_priv = torch.stack([priv_subset[i][0] for i in range(len(priv_subset))], dim=0).view(num_priv, -1)
-    y_priv_raw = torch.tensor([priv_subset[i][1] for i in range(len(priv_subset))], dtype=torch.float)
-    X_test = torch.stack([test_set[i][0] for i in range(len(test_set))], dim=0).view(len(test_set), -1)
-    y_test = torch.tensor([test_set[i][1] for i in range(len(test_set))], dtype=torch.long)
-    # Scale inputs to [-1,1]
-    X_priv = X_priv * 2.0 - 1.0
-    X_test = X_test * 2.0 - 1.0
-    # Scale targets to [-1,1]
-    y_priv = (y_priv_raw - 4.5) / 4.5
-    return X_priv, y_priv, X_test, y_test
+    if data_fraction < 1.0:
+        k = int(len(train) * data_fraction)
+        idx = torch.randperm(len(train))[:k]
+        train = Subset(train, idx)
 
+    train_loader = DataLoader(train, batch, shuffle=True,
+                              num_workers=workers, pin_memory=True)
+    test_loader  = DataLoader(test,  1024, shuffle=False,
+                              num_workers=workers, pin_memory=True)
+    return train_loader, test_loader
 
-def run_experiment(params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    """
-    Run a differentially private LASSO experiment on CIFAR‑10.
+# -----------------------------------------------------------------------------#
+#                         Training                                              #
+# -----------------------------------------------------------------------------#
+def fw_coordinate_step(theta: Tensor, grad: Tensor, t: int) -> Tensor:
+    """One Frank–Wolfe update along best ℓ₁ vertex."""
+    idx = torch.argmax(torch.abs(-grad)).item()
+    direction = -torch.sign(grad[idx])
+    γ = 2. / (t + 2.)                       # step‑size schedule
+    theta *= (1. - γ)
+    theta[idx] += γ * direction
+    return theta
 
-    Parameters
-    ----------
-    params : dict, optional
-        Hyper‑parameters controlling the experiment:
-          data_fraction : float   fraction of CIFAR‑10 used as private data (default 0.2).
-          num_iterations : int    number of Frank–Wolfe steps (default 50).
-          noise_mult : float      Gaussian noise multiplier controlling privacy (default 1.0).
-          delta : float           target δ for differential privacy (default 1e-5).
+def private_gradient(loader: DataLoader, theta: Tensor,
+                     noise_mult: float, device: torch.device) -> Tensor:
+    """Full‑batch grad with Gaussian noise (sensitivity 2/n)."""
+    n, p = 0, theta.numel()
+    g = torch.zeros(p, device=device)
+    for x, y in loader:                     # iterate once over *all* data
+        x = to_flat(x.to(device)) * 2. - 1. # scale to [‑1,1]
+        y = ((y.float().to(device)) - 4.5) / 4.5
+        r = x @ theta - y
+        g += x.t() @ r
+        n += x.size(0)
+    g *= 2. / n                             # ∇(MSE)
+    g += torch.randn_like(g) * (noise_mult * 2. / n)
+    return g
 
-    Returns
-    -------
-    Dict[str, Any]
-        A dictionary with keys ``final_accuracy``, ``epsilon``, ``history`` and ``final_loss``.
-    """
-    params = params or {}
-    data_fraction: float = params.get("data_fraction", 0.2)
-    num_iterations: int = params.get("num_iterations", 50)
-    noise_mult: float = params.get("noise_mult", 1.0)
-    delta: float = params.get("delta", 1e-5)
+# -----------------------------------------------------------------------------#
+def train_dp_lasso(cfg: Dict) -> Dict:
+    set_seed(cfg["seed"])
+    device = torch.device("cuda" if torch.cuda.is_available()
+                          else ("mps" if torch.backends.mps.is_available()
+                                else "cpu"))
 
-    # Load and prepare data
-    X_priv, y_priv, X_test, y_test = _prepare_data(data_fraction)
-    n_priv, p = X_priv.size()
+    tr_loader, te_loader = make_loaders(cfg["data_fraction"],
+                                        cfg["batch"], cfg["workers"])
+    p = 3 * 32 * 32
+    θ = torch.zeros(p, device=device)
 
-    # Initialise parameter vector inside ℓ1 ball
-    theta = torch.zeros(p)
-    # Precompute private dataset to GPU if available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    X_priv = X_priv.to(device)
-    y_priv = y_priv.to(device)
-    X_test = X_test.to(device)
-    theta = theta.to(device)
+    acct = RDPAccountant()
+    history: List[Dict] = []
+    for t in range(cfg["iterations"]):
+        tic = time.time()
+        g = private_gradient(tr_loader, θ, cfg["noise_mult"], device)
+        θ = fw_coordinate_step(θ, g, t)
+        acct.step(noise_multiplier=cfg["noise_mult"], sample_rate=1.)  # full‑batch
+        mse_priv = g.abs().mean().item()  # proxy, avoids second pass
+        history.append({"iter": t, "mse_proxy": mse_priv,
+                        "sec": time.time() - tic})
 
-    # Privacy accountant
-    accnt = RDPAccountant()
-
-    # History for tracking training loss
-    history: List[Dict[str, float]] = []
-
-    for t in range(num_iterations):
-        # Compute gradient of squared loss: grad = (2/n) X^T (Xθ - y)
-        preds = X_priv.mv(theta)
-        residual = preds - y_priv
-        grad = (2.0 / n_priv) * X_priv.t().mv(residual)
-        # Add Gaussian noise to gradient for privacy (approx exponential mechanism)
-        sensitivity = 2.0 / n_priv  # ℓ₂ sensitivity per coordinate
-        noise_scale = noise_mult * sensitivity
-        noise = torch.randn_like(grad) * noise_scale
-        grad_noisy = grad + noise
-        # Select coordinate with largest absolute negative gradient (descending direction)
-        # We use the negative noisy gradient as utility: larger means more decrease in loss.
-        scores = -grad_noisy
-        idx = torch.argmax(torch.abs(scores)).item()
-        # Determine sign: if gradient is positive, move in negative direction
-        direction = -torch.sign(grad[idx])
-        # Frank–Wolfe step size
-        step_size = 2.0 / (t + 2.0)
-        # Shrink all coordinates and update selected coordinate
-        theta = (1.0 - step_size) * theta
-        theta[idx] += step_size * direction
-        # Record mean squared error on private data
-        with torch.no_grad():
-            mse = (residual ** 2).mean().item()
-        history.append({"iteration": t, "mse": mse})
-        # Update privacy accountant
-        accnt.step(noise_multiplier=noise_mult, sample_rate=1.0 / n_priv)
-
-    # Evaluate on test set: convert predictions back to class labels
+    # --------------------  evaluation  -------------------------- #
+    θ_cpu = θ.cpu()
+    correct, total = 0, 0
     with torch.no_grad():
-        y_pred = X_test.mv(theta)
-        # Rescale predictions to original label range [0,9]
-        y_pred_rescaled = y_pred * 4.5 + 4.5
-        y_pred_clipped = torch.clamp(y_pred_rescaled, 0.0, 9.0)
-        y_pred_int = torch.round(y_pred_clipped).long()
-        correct = (y_pred_int.cpu() == y_test).sum().item()
-        final_accuracy = 100.0 * correct / len(y_test)
-        final_loss = F.mse_loss(X_test.mv(theta), y_priv.mean() * torch.ones_like(y_test, dtype=torch.float, device=device)).item()  # dummy loss
+        for x, y in te_loader:
+            x = to_flat(x) * 2. - 1.
+            y_hat = x @ θ_cpu
+            y_hat = torch.clamp(y_hat*4.5 + 4.5, 0., 9.)
+            correct += (y_hat.round().long() == y).sum().item()
+            total   += y.size(0)
 
-    epsilon = accnt.get_epsilon(delta)
-    # Clear GPU memory after use
+    acc = 100. * correct / total
+    eps = acct.get_epsilon(cfg["delta"])
     clear_memory()
 
-    return {
-        "final_accuracy": float(final_accuracy),
-        "epsilon": float(epsilon),
-        "history": history,
-        "final_loss": float(final_loss),
-    }
+    return {"final_accuracy": acc,
+            "epsilon": eps,
+            "delta":   cfg["delta"],
+            "history": history}
+
+# -----------------------------------------------------------------------------#
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_fraction", type=float, default=1.0)
+    ap.add_argument("--iterations",    type=int,   default=200)
+    ap.add_argument("--noise_mult",    type=float, default=1.0)
+    ap.add_argument("--delta",         type=float, default=1e-5)
+    ap.add_argument("--batch",         type=int,   default=2048)
+    ap.add_argument("--workers",       type=int,   default=4)
+    ap.add_argument("--seed",          type=int,   default=42)
+    ap.add_argument("--out",           type=str,   default="dp_lasso_results")
+    cfg = vars(ap.parse_args())
+
+    os.makedirs(cfg["out"], exist_ok=True)
+    res = train_dp_lasso(cfg)
+
+    # ----------- persist -------------- #
+    ts = int(time.time())
+    with open(Path(cfg["out"]) / f"run_{ts}.json", "w") as f:
+        json.dump({**cfg, **res}, f, indent=2)
+
+    print(f"Accuracy: {res['final_accuracy']:.2f}%")
+    print(f"ε = {res['epsilon']:.3f}  (δ = {cfg['delta']})")
+
+if __name__ == "__main__":
+    main()

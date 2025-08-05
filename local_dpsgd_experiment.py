@@ -73,25 +73,26 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def apply_params(params: dict | ExperimentConfig | None) -> None:
-    """Override global hyperparameters using ``params``."""
+    """
+    Override global hyperparameters with the values in `params`.
+
+    Any time PRIV_BATCH or PUB_BATCH is changed, α_SCALE is recomputed so
+    that PUBLIC_METHOD == "mixsub" continues to use the correct weighting.
+    """
     if not params:
         return
-    if isinstance(params, ExperimentConfig):
+    if isinstance(params, ExperimentConfig):      # allow dataclass input
         params = asdict(params)
+
     for k, v in params.items():
         if k in globals():
             globals()[k] = v
 
-
-DEFAULT_PARAMS = asdict(DEFAULT_CONFIG)
-
-def apply_params(params: dict | None) -> None:
-    """Override global hyperparameters using ``params``."""
-    if not params:
-        return
-    for k, v in params.items():
-        if k in globals():
-            globals()[k] = v
+    # ---- keep α_SCALE in sync with the latest batch sizes ----------
+    if ("PRIV_BATCH" in params) or ("PUB_BATCH" in params):
+        globals()["α_SCALE"] = globals()["PUB_BATCH"] / (
+            globals()["PRIV_BATCH"] + globals()["PUB_BATCH"]
+        )
 
 # ------------------------------------------------------------------
 # 2.  RNG
@@ -216,24 +217,52 @@ else:
     get_pub_iter = lambda: cycle(train_pub)         # original behaviour
 
 
-def mixup_batch(X1, y1, X2=None, y2=None, alpha=MIXUP_ALPHA):
-    """Return mixup of two batches.
-
-    If ``X2``/``y2`` are ``None`` the second batch is created by shuffling
-    ``X1``/``y1``. Labels are returned as soft one-hot encodings so that they can
-    be used with the modified ``local_updates`` function above.
+# ---------------------------------------------------------------
+# 2.  Mixup helper – now batch‑size agnostic
+# ---------------------------------------------------------------
+def mixup_batch(
+    X1: torch.Tensor,
+    y1: torch.Tensor,
+    X2: torch.Tensor | None = None,
+    y2: torch.Tensor | None = None,
+    alpha: float = MIXUP_ALPHA,
+):
     """
-    if X2 is None or y2 is None:
+    Return a mixup of two mini‑batches.
+
+    * If `X2`/`y2` are omitted, performs standard *self‑mixup* by shuffling
+      `X1`/`y1`.
+    * If `X2`/`y2` are provided **but the batch lengths differ**, the second
+      batch is automatically resampled (with replacement if it is shorter,
+      or randomly trimmed if it is longer) so that both tensors have the
+      same first‑dimension size.  This prevents the “size mismatch” runtime
+      error raised by PyTorch when broadcasting fails.
+    """
+    # ---- choose the two source batches ---------------------------------------
+    if X2 is None or y2 is None:                       # self‑mixup path
         perm = torch.randperm(X1.size(0), device=X1.device)
         X2, y2 = X1[perm], y1[perm]
+
+    elif X2.size(0) != X1.size(0):                     # cross‑mixup, unequal
+        if X2.size(0) < X1.size(0):                    # pad the smaller batch
+            idx = torch.randint(
+                0, X2.size(0), (X1.size(0),),
+                device=X2.device,
+                dtype=torch.long,
+            )
+        else:                                          # trim the larger batch
+            idx = torch.randperm(X2.size(0), device=X2.device)[: X1.size(0)]
+        X2, y2 = X2[idx], y2[idx]
+
+    # ---- compute the convex combination --------------------------------------
     lam = np.random.beta(alpha, alpha)
     X = lam * X1 + (1 - lam) * X2
+
     n_classes = 10
     y1_one = F.one_hot(y1, n_classes).float() if y1.dim() == 1 else y1
     y2_one = F.one_hot(y2, n_classes).float() if y2.dim() == 1 else y2
     y = lam * y1_one + (1 - lam) * y2_one
     return X, y
-
 
 
 # ------------------------------------------------------------------
