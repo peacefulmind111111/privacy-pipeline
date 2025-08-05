@@ -11,6 +11,9 @@ def default_device() -> torch.device:
 class ExperimentConfig:
     """Holds hyperparameters for a DP experiment."""
 
+    # metadata
+    experiment_name: str = "dp_experiment"
+
     # training hyperparameters
     seed: int = 0
     batch_size: int = 512

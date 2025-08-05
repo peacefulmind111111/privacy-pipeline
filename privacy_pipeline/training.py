@@ -9,6 +9,7 @@ import torch.optim as optim
 from opacus.accountants import RDPAccountant
 
 from .config import ExperimentConfig
+from .logger import ExperimentLogger
 from .data import get_dataloaders, set_random_seeds
 from .grad_ops import (
     clip_sum_noise,
@@ -47,6 +48,7 @@ def train(cfg: ExperimentConfig, output_dir: str, plot_every: int = 5) -> Dict[s
     )
     accountant = RDPAccountant()
     momentum_dict = LRUOrderedDict(maxsize=cfg.max_momentum_size)
+    logger = ExperimentLogger(cfg, output_dir)
 
     total_steps = cfg.num_epochs * len(train_loader)
     step_count = 0
@@ -93,15 +95,32 @@ def train(cfg: ExperimentConfig, output_dir: str, plot_every: int = 5) -> Dict[s
             epoch_postclip_l2.extend(post_l2)
             epoch_postclip_cos.extend(post_cos)
 
+            grad_norm = final_grad.norm(2).item()
             outer_step(dp_net, optimizer, final_grad)
 
             with torch.no_grad():
                 out = dp_net(X)
                 loss_val = F.cross_entropy(out, y)
+                preds = out.argmax(dim=1)
+                batch_acc = (preds == y).float().mean().item()
             losses.append(loss_val.item())
 
             sample_rate = unique_count / 50000.0
             accountant.step(noise_multiplier=cfg.noise_mult, sample_rate=sample_rate)
+            eps = accountant.get_epsilon(cfg.delta)
+
+            logger.log(
+                step_count,
+                {
+                    "epoch": epoch,
+                    "loss": float(loss_val.item()),
+                    "train_accuracy": float(batch_acc),
+                    "epsilon": float(eps),
+                    "clip_value": float(clip_val),
+                    "grad_norm": float(grad_norm),
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                },
+            )
 
         scheduler.step()
         acc = evaluate(dp_net, test_loader, device)
@@ -172,8 +191,7 @@ def train(cfg: ExperimentConfig, output_dir: str, plot_every: int = 5) -> Dict[s
         "final_accuracy": float(final_acc),
         "final_epsilon": float(final_eps),
     }
-    with open(os.path.join(output_dir, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
+    logger.save({"test_accuracy": results["final_accuracy"], "epsilon": results["final_epsilon"]})
     return results
 
 
@@ -200,6 +218,7 @@ def train_with_outlier_clipping(
     )
     accountant = RDPAccountant()
     momentum_dict = LRUOrderedDict(maxsize=cfg.max_momentum_size)
+    logger = ExperimentLogger(cfg, output_dir)
 
     sample_correct = np.zeros(base_size, dtype=int)
     sample_total = np.zeros(base_size, dtype=int)
@@ -242,14 +261,31 @@ def train_with_outlier_clipping(
             final_grad = clip_sum_noise_per_sample(
                 vecs, clip_vals, cfg.noise_mult, do_noise=True
             )
+            grad_norm = final_grad.norm(2).item()
             outer_step(dp_net, optimizer, final_grad)
 
             with torch.no_grad():
+                preds = dp_net(X).argmax(dim=1)
                 loss_val = F.cross_entropy(dp_net(X), y)
+                batch_acc = (preds == y).float().mean().item()
             losses.append(loss_val.item())
 
             sample_rate = unique_count / float(base_size)
             accountant.step(noise_multiplier=cfg.noise_mult, sample_rate=sample_rate)
+            eps = accountant.get_epsilon(cfg.delta)
+
+            logger.log(
+                step_count,
+                {
+                    "epoch": epoch,
+                    "loss": float(loss_val.item()),
+                    "train_accuracy": float(batch_acc),
+                    "epsilon": float(eps),
+                    "clip_value": float(np.mean(clip_vals) if clip_vals else 0.0),
+                    "grad_norm": float(grad_norm),
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                },
+            )
 
         scheduler.step()
         acc = evaluate(dp_net, test_loader, device)
@@ -275,6 +311,5 @@ def train_with_outlier_clipping(
         "final_accuracy": float(final_acc),
         "final_epsilon": float(final_eps),
     }
-    with open(os.path.join(output_dir, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
+    logger.save({"test_accuracy": results["final_accuracy"], "epsilon": results["final_epsilon"]})
     return results
