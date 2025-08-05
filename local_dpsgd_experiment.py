@@ -57,6 +57,9 @@ class ExperimentConfig:
     GAMMA: float = 0.1
     DATA_FRACTION: float = 0.2
     SELF_AUG_FACTOR: int = 1
+    MIXUP_MODE: str | None = None
+    MIXUP_ALPHA: float = 0.4
+    MOMENTUM_LOCAL: float = 0.0
 
 
 DEFAULT_CONFIG = ExperimentConfig()
@@ -211,6 +214,25 @@ if FIXED_PUB:
 else:
     from itertools import cycle
     get_pub_iter = lambda: cycle(train_pub)         # original behaviour
+
+
+def mixup_batch(X1, y1, X2=None, y2=None, alpha=MIXUP_ALPHA):
+    """Return mixup of two batches.
+
+    If ``X2``/``y2`` are ``None`` the second batch is created by shuffling
+    ``X1``/``y1``. Labels are returned as soft one-hot encodings so that they can
+    be used with the modified ``local_updates`` function above.
+    """
+    if X2 is None or y2 is None:
+        perm = torch.randperm(X1.size(0), device=X1.device)
+        X2, y2 = X1[perm], y1[perm]
+    lam = np.random.beta(alpha, alpha)
+    X = lam * X1 + (1 - lam) * X2
+    n_classes = 10
+    y1_one = F.one_hot(y1, n_classes).float() if y1.dim() == 1 else y1
+    y2_one = F.one_hot(y2, n_classes).float() if y2.dim() == 1 else y2
+    y = lam * y1_one + (1 - lam) * y2_one
+    return X, y
 
 
 
@@ -472,7 +494,14 @@ def local_updates(global_model, X, y):
         opt = optim.SGD(local.parameters(), lr=ETA_LOCAL)
         for _ in range(K_LOCAL):
             opt.zero_grad(set_to_none=True)
-            F.cross_entropy(local(X[j:j + 1]), y[j:j + 1]).backward()
+            preds = local(X[j:j + 1])
+            target = y[j:j + 1]
+            if target.dim() == 2:
+                logp = F.log_softmax(preds, dim=1)
+                loss = -(target * logp).sum()
+            else:
+                loss = F.cross_entropy(preds, target)
+            loss.backward()
             opt.step()
         deltas.append(flat(local) - base)
         del local
@@ -490,6 +519,7 @@ def train_local(use_public: bool):
 
     accnt, sr   = RDPAccountant(), PRIV_BATCH / N_PRIVATE
     pub_iter = get_pub_iter() if use_public else None
+    velocity = torch.zeros_like(flat(model))
 
     log, step   = init_log(), 0
     total       = NUM_EPOCHS * len(train_priv)
@@ -509,33 +539,49 @@ def train_local(use_public: bool):
             Xp, yp = Xp.to(DEVICE), yp.to(DEVICE)
             n_priv = Xp.size(0)
 
-            if use_public:
-                Xq, yq = next(pub_iter); Xq, yq = Xq.to(DEVICE), yq.to(DEVICE)
-                X = torch.cat([Xp, Xq]); y = torch.cat([yp, yq])
-            else:
-                X, y = Xp, yp
-
-            # ---- local client updates (no clip/noise yet) ----------------------
-            deltas = local_updates(model, X, y)
-
-            if use_public:
-                delta_priv, delta_pub = deltas[:n_priv], deltas[n_priv:]
-            else:
-                delta_priv, delta_pub = deltas, None
-
-            Δp_bar, _, _ = clip_agg(delta_priv, C_CLIP_PRIV, add_noise=True)
-            if delta_pub is not None and delta_pub.numel():
-                Δq_bar, _, _ = clip_agg(delta_pub, C_CLIP_PUB, add_noise=False)
-            else:
+            if MIXUP_MODE:
+                if MIXUP_MODE == "diff":
+                    Xq, yq = next(pub_iter); Xq, yq = Xq.to(DEVICE), yq.to(DEVICE)
+                    X, y = mixup_batch(Xp, yp, Xq, yq, MIXUP_ALPHA)
+                else:  # self
+                    X, y = mixup_batch(Xp, yp, alpha=MIXUP_ALPHA)
+                deltas = local_updates(model, X, y)
+                Δp_bar, _, _ = clip_agg(deltas, C_CLIP_PRIV / 2, add_noise=True)
                 Δq_bar = torch.zeros_like(Δp_bar)
+            else:
+                if use_public:
+                    Xq, yq = next(pub_iter); Xq, yq = Xq.to(DEVICE), yq.to(DEVICE)
+                    X = torch.cat([Xp, Xq]); y = torch.cat([yp, yq])
+                else:
+                    X, y = Xp, yp
+
+                # ---- local client updates (no clip/noise yet) ------------------
+                deltas = local_updates(model, X, y)
+
+                if use_public:
+                    delta_priv, delta_pub = deltas[:n_priv], deltas[n_priv:]
+                else:
+                    delta_priv, delta_pub = deltas, None
+
+                Δp_bar, _, _ = clip_agg(delta_priv, C_CLIP_PRIV, add_noise=True)
+                if delta_pub is not None and delta_pub.numel():
+                    Δq_bar, _, _ = clip_agg(delta_pub, C_CLIP_PUB, add_noise=False)
+                else:
+                    Δq_bar = torch.zeros_like(Δp_bar)
 
             # ---- mix private & public -----------------------------------------
             if   not use_public:          update = Δp_bar
             elif PUBLIC_METHOD == "add":  update = Δp_bar + Δq_bar
             else:                         update = Δp_bar - α_SCALE * Δq_bar
 
+            if MOMENTUM_LOCAL > 0:
+                velocity.mul_(MOMENTUM_LOCAL).add_(update)
+                step_update = velocity
+            else:
+                step_update = update
+
             # ---- outer update (no extra shrink) -------------------------------
-            assign(model, flat(model) + OUTER_LR_LOCAL * update.to(DEVICE))
+            assign(model, flat(model) + OUTER_LR_LOCAL * step_update.to(DEVICE))
 
             # ---- bookkeeping & debug ------------------------------------------
             log["l1_priv"].append(l1(Δp_bar)); log["l2_priv"].append(l2(Δp_bar))
@@ -553,6 +599,24 @@ def train_local(use_public: bool):
         dummy_sched.step()
 
     return summary(model, accnt, log, "local_" + ("pub" if use_public else "priv"))
+
+
+def train_mixup(use_public: bool, mode: str):
+    """Train DP-SGD with mixup augmentations.
+
+    ``mode`` controls whether private examples are mixed with themselves ("self")
+    or with synthetic diffusion samples ("diff").  The ``use_public`` flag is
+    forwarded so that synthetic samples can be drawn when required.
+    """
+    apply_params({"MIXUP_MODE": mode})
+    return train_local(use_public)
+
+
+def train_momentum(use_public: bool):
+    """Wrapper to run local DP-SGD with momentum enabled."""
+    if MOMENTUM_LOCAL <= 0:
+        apply_params({"MOMENTUM_LOCAL": 0.9})
+    return train_local(use_public)
 
 # ------------------------------------------------------------------
 # 8-C. DP-SCAFFOLD
@@ -705,10 +769,9 @@ def summary(model, accnt, log, name, plot: bool = False):
 def run_experiment(
     experiment: str = EXPERIMENT,
     params: dict | None = None,
-
     output_dir: str | None = None,
     filename: str | None = None,
-
+):
     """Run one of the DP-SGD experiments and optionally save metrics."""
     apply_params(params)
 
