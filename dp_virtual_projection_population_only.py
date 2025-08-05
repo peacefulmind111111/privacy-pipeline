@@ -10,55 +10,71 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import OrderedDict
+from dataclasses import dataclass, asdict
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, ConcatDataset, Subset
+from experiment_utils import save_json, clear_memory
 
 # Opacus
 from opacus.validators import ModuleValidator
 from opacus.grad_sample import GradSampleModule
 
 ###############################################################################
-# 0. Hyperparameters
+# 0. Hyperparameter dataclass
 ###############################################################################
-seed                 = 0
-random.seed(seed);  torch.manual_seed(seed);  np.random.seed(seed)
-
-batch_size           = 1000
-lr                   = 0.1
-outer_momentum       = 0.9
-inner_momentum       = 0.0
-noise_mult           = 0.0          # no DP noise in this script
-delta                = 1e-5
-num_epochs           = 10            # ← raise above warm_start_epochs for real runs
-M                    = 0             # momentum dictionary capacity
-self_aug_factor      = 1
-
-# --- Projection experiment knobs --------------------------------------------
-warm_start_epochs     = 2           # plain-SGD epochs before any projection
-proj_lr_multiplier    = 3.0         # bump LR when projection begins
-scale_pprime_to_pL2   = True       # re-norm p′ so ‖p′‖₂ = ‖p‖₂
-trust_mix_alpha       = 1           # 0→raw p ; 1→pure p′
-rebuild_basis_every   = 3           # epochs; 0→never rebuild
-# -----------------------------------------------------------------------------
 
 
-# -- Virtual-sample parameters --
-subsets_per_class      = 25
-subset_size            = 200
-virtual_augment_factor = 10
+@dataclass
+class ExperimentConfig:
+    seed: int = 0
+    batch_size: int = 1000
+    lr: float = 0.1
+    outer_momentum: float = 0.9
+    inner_momentum: float = 0.0
+    noise_mult: float = 0.0  # no DP noise in this script
+    delta: float = 1e-5
+    num_epochs: int = 10  # ← raise above warm_start_epochs for real runs
+    M: int = 0  # momentum dictionary capacity
+    self_aug_factor: int = 1
+    # Projection experiment knobs
+    warm_start_epochs: int = 2  # plain-SGD epochs before any projection
+    proj_lr_multiplier: float = 3.0  # bump LR when projection begins
+    scale_pprime_to_pL2: bool = True  # re-norm p′ so ‖p′‖₂ = ‖p‖₂
+    trust_mix_alpha: float = 1.0  # 0→raw p ; 1→pure p′
+    rebuild_basis_every: int = 3  # epochs; 0→never rebuild
+    # Virtual-sample parameters
+    subsets_per_class: int = 25
+    subset_size: int = 200
+    virtual_augment_factor: int = 10
+    # “No-clipping” setup (huge C so clipping never triggers)
+    c_start: float = 1e9
+    c_end: float = 1e9
 
-# -- “No-clipping” setup (huge C so clipping never triggers)
-c_start = 1e9;  c_end = 1e9
+
+DEFAULT_CONFIG = ExperimentConfig()
+for _k, _v in asdict(DEFAULT_CONFIG).items():
+    globals()[_k] = _v
+
+random.seed(seed)
+torch.manual_seed(seed)
+np.random.seed(seed)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def apply_params(params: dict | None) -> None:
+def apply_params(params: dict | ExperimentConfig | None) -> None:
     """Override module-level hyperparameters with ``params``."""
     if not params:
         return
+    if isinstance(params, ExperimentConfig):
+        params = asdict(params)
+
     for k, v in params.items():
         if k in globals():
             globals()[k] = v
+
+
+DEFAULT_PARAMS = asdict(DEFAULT_CONFIG)
+
 
 ###############################################################################
 # 0.1 Memory helper
@@ -402,17 +418,14 @@ def run_training(dp_net,
 ###############################################################################
 # 10-B. main_run
 ###############################################################################
-def main_run(params: dict | None = None, output_path: str | None = None):
-    """Run the virtual projection experiment.
 
-    Parameters
-    ----------
-    params: dict, optional
-        Hyperparameters to override at runtime.
-    output_path: str, optional
-        Where to save a JSON report of metrics. If ``None`` the report is
-        returned but not written to disk.
-    """
+def main_run(
+    params: dict | None = None,
+    output_dir: str | None = None,
+    filename: str | None = None,
+):
+    """Run the virtual projection experiment and optionally write JSON metrics."""
+
     apply_params(params)
     print_memory_usage("Start")
 
@@ -464,24 +477,39 @@ def main_run(params: dict | None = None, output_path: str | None = None):
         {"epoch": i + 1, "loss": float(l), "accuracy": float(a)}
         for i, (l, a) in enumerate(zip(proj_stats["loss"], proj_stats["acc"]))
     ]
-    results = {
-        "experiment_name": "dp_virtual_projection",
-        "hyperparameters": params or {},
-        "history": history,
-        "final_metrics": {
-            "accuracy": final_acc,
-            "mean_diff_L2": mean_diff,
-            "mean_cos": mean_cos,
-        },
+
+    final_loss = float(proj_stats["loss"][-1]) if proj_stats["loss"] else None
+    final_metrics = {
+        "accuracy": final_acc,
+        "mean_diff_L2": mean_diff,
+        "mean_cos": mean_cos,
+        "final_loss": final_loss,
     }
 
-    if output_path:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
+    results = save_json(
+        experiment="dp_virtual_projection",
+        params=params or {},
+        history=history,
+        final_metrics=final_metrics,
+        output_dir=output_dir,
+        filename=filename,
+    )
+    clear_memory()
     return results
+
+# -----------------------------------------------------------------------------
+def train(
+    cfg: ExperimentConfig | None = None,
+    output_dir: str | None = None,
+    filename: str | None = None,
+):
+    """Convenience wrapper accepting a dataclass config and output directory."""
+    cfg = cfg or ExperimentConfig()
+    params = asdict(cfg)
+    return main_run(params=params, output_dir=output_dir, filename=filename)
 
 ###############################################################################
 if __name__ == "__main__":
-    main_run(output_path=os.path.join("outputs", "dp_virtual_projection.json"))
+    train(ExperimentConfig(), "outputs")
+
 
