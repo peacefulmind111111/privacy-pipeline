@@ -78,6 +78,9 @@ def train(cfg: ExperimentConfig, output_dir: str, plot_every: int = 5) -> Dict[s
             epoch_preclip_l1.extend(pre_l1)
             epoch_preclip_l2.extend(pre_l2)
             epoch_preclip_cos.extend(pre_cos)
+            pre_l1_mean = float(np.mean(pre_l1)) if pre_l1 else 0.0
+            pre_l2_mean = float(np.mean(pre_l2)) if pre_l2 else 0.0
+            pre_cos_mean = float(np.mean(pre_cos)) if pre_cos else 0.0
 
             final_grad, _ = clip_sum_noise(
                 batch_v, clip_val, cfg.noise_mult, do_noise=True, return_postclip=True
@@ -94,6 +97,9 @@ def train(cfg: ExperimentConfig, output_dir: str, plot_every: int = 5) -> Dict[s
             epoch_postclip_l1.extend(post_l1)
             epoch_postclip_l2.extend(post_l2)
             epoch_postclip_cos.extend(post_cos)
+            post_l1_mean = float(np.mean(post_l1)) if post_l1 else 0.0
+            post_l2_mean = float(np.mean(post_l2)) if post_l2 else 0.0
+            post_cos_mean = float(np.mean(post_cos)) if post_cos else 0.0
 
             grad_norm = final_grad.norm(2).item()
             outer_step(dp_net, optimizer, final_grad)
@@ -119,6 +125,12 @@ def train(cfg: ExperimentConfig, output_dir: str, plot_every: int = 5) -> Dict[s
                     "clip_value": float(clip_val),
                     "grad_norm": float(grad_norm),
                     "lr": float(optimizer.param_groups[0]["lr"]),
+                    "pre_l1": pre_l1_mean,
+                    "pre_l2": pre_l2_mean,
+                    "pre_cos": pre_cos_mean,
+                    "post_l1": post_l1_mean,
+                    "post_l2": post_l2_mean,
+                    "post_cos": post_cos_mean,
                 },
             )
 
@@ -245,6 +257,11 @@ def train_with_outlier_clipping(
                 dp_net, X, y, idxs, momentum_dict, cfg.inner_momentum, device, base_size
             )
             vecs = [g for (_, g) in batch_v]
+            pre_l1, pre_l2, pre_cos = measure_distribution(vecs)
+            pre_l1_mean = float(np.mean(pre_l1)) if pre_l1 else 0.0
+            pre_l2_mean = float(np.mean(pre_l2)) if pre_l2 else 0.0
+            pre_cos_mean = float(np.mean(pre_cos)) if pre_cos else 0.0
+
             if step_count <= cfg.drop_after_frac * total_steps:
                 clip_vals = [cfg.default_clip] * len(vecs)
             else:
@@ -257,6 +274,15 @@ def train_with_outlier_clipping(
                         clip_vals.append(cfg.outlier_clip)
                     else:
                         clip_vals.append(cfg.default_clip)
+
+            clipped_vecs = []
+            for v, c in zip(vecs, clip_vals):
+                nm = v.norm(2).item()
+                clipped_vecs.append(v * (c / (nm + 1e-9)) if nm > c else v)
+            post_l1, post_l2, post_cos = measure_distribution(clipped_vecs)
+            post_l1_mean = float(np.mean(post_l1)) if post_l1 else 0.0
+            post_l2_mean = float(np.mean(post_l2)) if post_l2 else 0.0
+            post_cos_mean = float(np.mean(post_cos)) if post_cos else 0.0
 
             final_grad = clip_sum_noise_per_sample(
                 vecs, clip_vals, cfg.noise_mult, do_noise=True
@@ -284,6 +310,12 @@ def train_with_outlier_clipping(
                     "clip_value": float(np.mean(clip_vals) if clip_vals else 0.0),
                     "grad_norm": float(grad_norm),
                     "lr": float(optimizer.param_groups[0]["lr"]),
+                    "pre_l1": pre_l1_mean,
+                    "pre_l2": pre_l2_mean,
+                    "pre_cos": pre_cos_mean,
+                    "post_l1": post_l1_mean,
+                    "post_l2": post_l2_mean,
+                    "post_cos": post_cos_mean,
                 },
             )
 

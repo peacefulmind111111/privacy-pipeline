@@ -2,7 +2,7 @@
 # Filename: dp_virtual_projection_population_only.py
 # (2025-07-03 patched version)
 ##############################################################
-import os, psutil, random, math, time, statistics
+import os, psutil, random, math, time, statistics, json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,47 +10,70 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import OrderedDict
+from dataclasses import dataclass, asdict
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, ConcatDataset, Subset
+from experiment_utils import save_json, clear_memory
 
 # Opacus
 from opacus.validators import ModuleValidator
 from opacus.grad_sample import GradSampleModule
 
 ###############################################################################
-# 0. Hyperparameters
+# 0. Hyperparameter dataclass
 ###############################################################################
-seed                 = 0
-random.seed(seed);  torch.manual_seed(seed);  np.random.seed(seed)
-
-batch_size           = 1000
-lr                   = 0.1
-outer_momentum       = 0.9
-inner_momentum       = 0.0
-noise_mult           = 0.0          # no DP noise in this script
-delta                = 1e-5
-num_epochs           = 10            # ← raise above warm_start_epochs for real runs
-M                    = 0             # momentum dictionary capacity
-self_aug_factor      = 1
-
-# --- Projection experiment knobs --------------------------------------------
-warm_start_epochs     = 2           # plain-SGD epochs before any projection
-proj_lr_multiplier    = 3.0         # bump LR when projection begins
-scale_pprime_to_pL2   = True       # re-norm p′ so ‖p′‖₂ = ‖p‖₂
-trust_mix_alpha       = 1           # 0→raw p ; 1→pure p′
-rebuild_basis_every   = 3           # epochs; 0→never rebuild
-# -----------------------------------------------------------------------------
 
 
-# -- Virtual-sample parameters --
-subsets_per_class      = 25
-subset_size            = 200
-virtual_augment_factor = 10
+@dataclass
+class ExperimentConfig:
+    seed: int = 0
+    batch_size: int = 1000
+    lr: float = 0.1
+    outer_momentum: float = 0.9
+    inner_momentum: float = 0.0
+    noise_mult: float = 0.0  # no DP noise in this script
+    delta: float = 1e-5
+    num_epochs: int = 10  # ← raise above warm_start_epochs for real runs
+    M: int = 0  # momentum dictionary capacity
+    self_aug_factor: int = 1
+    # Projection experiment knobs
+    warm_start_epochs: int = 2  # plain-SGD epochs before any projection
+    proj_lr_multiplier: float = 3.0  # bump LR when projection begins
+    scale_pprime_to_pL2: bool = True  # re-norm p′ so ‖p′‖₂ = ‖p‖₂
+    trust_mix_alpha: float = 1.0  # 0→raw p ; 1→pure p′
+    rebuild_basis_every: int = 3  # epochs; 0→never rebuild
+    # Virtual-sample parameters
+    subsets_per_class: int = 25
+    subset_size: int = 200
+    virtual_augment_factor: int = 10
+    # “No-clipping” setup (huge C so clipping never triggers)
+    c_start: float = 1e9
+    c_end: float = 1e9
 
-# -- “No-clipping” setup (huge C so clipping never triggers)
-c_start = 1e9;  c_end = 1e9
+
+DEFAULT_CONFIG = ExperimentConfig()
+for _k, _v in asdict(DEFAULT_CONFIG).items():
+    globals()[_k] = _v
+
+random.seed(seed)
+torch.manual_seed(seed)
+np.random.seed(seed)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def apply_params(params: dict | ExperimentConfig | None) -> None:
+    """Override module-level hyperparameters with ``params``."""
+    if not params:
+        return
+    if isinstance(params, ExperimentConfig):
+        params = asdict(params)
+    for k, v in params.items():
+        if k in globals():
+            globals()[k] = v
+
+
+DEFAULT_PARAMS = asdict(DEFAULT_CONFIG)
 
 ###############################################################################
 # 0.1 Memory helper
@@ -288,7 +311,7 @@ def run_training(dp_net,
 
     # <<< NEW -----------------------------------------------------------------
     # Local trackers to diagnose the projection run as well
-    local_diff_L2, local_cos = [], []
+    local_diff_L1, local_diff_L2, local_cos = [], [], []
     # -------------------------------------------------------------------------
 
     for epoch in range(1, num_epochs + 1):
@@ -348,10 +371,13 @@ def run_training(dp_net,
 
             # <<< NEW: on-the-fly projection diagnostics (always on) --------
             with torch.no_grad():
-                diff = (p - p_prime).norm().item()
+                diff_vec = p - p_prime
+                diff_l1 = diff_vec.norm(p=1).item()
+                diff_l2 = diff_vec.norm().item()
                 cos  = torch.dot(p, p_prime).item() / (
                        p.norm().item() * p_prime.norm().item() + 1e-12)
-                local_diff_L2.append(diff)
+                local_diff_L1.append(diff_l1)
+                local_diff_L2.append(diff_l2)
                 local_cos.append(cos)
             # ----------------------------------------------------------------
 
@@ -385,85 +411,109 @@ def run_training(dp_net,
               f"({minutes:.1f} min)\n")
 
     # <<< NEW: return extra diagnostics -------------------------------------
-    return {"loss": epoch_losses,
-            "acc": epoch_accs,
-            "diff_L2": local_diff_L2,
-            "cos": local_cos}
+    return {
+        "loss": epoch_losses,
+        "acc": epoch_accs,
+        "diff_L1": local_diff_L1,
+        "diff_L2": local_diff_L2,
+        "cos": local_cos,
+    }
     # -----------------------------------------------------------------------
 
 ###############################################################################
 # 10-B. main_run
 ###############################################################################
-def main_run():
+def main_run(
+    params: dict | None = None,
+    output_dir: str | None = None,
+    filename: str | None = None,
+):
+    """Run the virtual projection experiment and optionally write JSON metrics."""
+    apply_params(params)
     print_memory_usage("Start")
 
     # A) build virtual subsets
-    v_subsets = build_virtual_subsets(train_ds,subsets_per_class,subset_size,
-                                      virtual_augment_factor)
+    v_subsets = build_virtual_subsets(
+        train_ds, subsets_per_class, subset_size, virtual_augment_factor
+    )
     print(f"Built {len(v_subsets)} virtual subsets.")
 
     # B) compute e_i for every virtual subset
     base_net = ResNet20().to(device).eval()
-    e_list = [compute_fullmodel_grad_for_subset(base_net,idxs,train_ds)
-              for idxs,_ in v_subsets]
+    e_list = [compute_fullmodel_grad_for_subset(base_net, idxs, train_ds)
+              for idxs, _ in v_subsets]
     e_basis = gram_schmidt(e_list)
     print(f"Orthonormal basis size = {len(e_basis)}/{len(e_list)}")
 
-    def project_onto(vec,basis):
-        out=torch.zeros_like(vec)
-        for b in basis: out += torch.dot(vec,b)*b
+    def project_onto(vec, basis):
+        out = torch.zeros_like(vec)
+        for b in basis:
+            out += torch.dot(vec, b) * b
         return out
-
 
     # ProjSGD (after warm-start)
     dp_proj = build_model().to(device)
-    opt_proj = optim.SGD(dp_proj.parameters(),lr=lr,momentum=outer_momentum,
-                         weight_decay=5e-4)
-    proj_stats = run_training(dp_proj,opt_proj,True,
-                               e_basis,project_onto,
-                               train_loader,test_loader)
+    opt_proj = optim.SGD(
+        dp_proj.parameters(), lr=lr, momentum=outer_momentum, weight_decay=5e-4
+    )
+    proj_stats = run_training(
+        dp_proj,
+        opt_proj,
+        True,
+        e_basis,
+        project_onto,
+        train_loader,
+        test_loader,
+    )
 
-    ##################################################################
-    # Visualisations
-    ##################################################################
-    epochs = range(1,num_epochs+1)
-    steps  = range(1,len(proj_stats['diff_L2'])+1)  # <<< NEW
-
-    # 0) SGD-vs-ProjSGD curves
-    plt.figure(figsize=(11,4))
-    plt.subplot(1,2,1)
-    #plt.plot(epochs,base_stats['loss'],'-o',label='SGD (p)')
-    plt.plot(epochs,proj_stats['loss'],'-o',label='ProjSGD (p′)')
-    plt.title("Training Loss per Epoch"); plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend()
-    plt.subplot(1,2,2)
-    #plt.plot(epochs,base_stats['acc'],'-o',label='SGD (p)')
-    plt.plot(epochs,proj_stats['acc'],'-o',label='ProjSGD (p′)')
-    plt.title("Test Accuracy per Epoch"); plt.xlabel("Epoch"); plt.ylabel("Accuracy (%)"); plt.legend()
-    plt.tight_layout(); plt.show()
-
-    # <<< NEW: projection diagnostics ---------------------------------------
-    plt.figure(figsize=(10,4))
-    plt.subplot(1,2,1)
-    plt.plot(steps,proj_stats['diff_L2'],color='red')
-    plt.title("‖p − p′‖₂ over Steps (Proj run)")
-    plt.xlabel("Training Step"); plt.ylabel("L2 Norm")
-    plt.subplot(1,2,2)
-    plt.plot(steps,proj_stats['cos'],color='orange')
-    plt.title("Cosine Similarity(p, p′) (Proj run)")
-    plt.xlabel("Training Step"); plt.ylabel("Cosine")
-    plt.tight_layout(); plt.show()
-    # ----------------------------------------------------------------------
-
-    # Quick stats
+    # Quick stats -----------------------------------------------------------
+    mean_diff_l1 = float(np.mean(proj_stats["diff_L1"]))
+    mean_diff_l2 = float(np.mean(proj_stats["diff_L2"]))
+    mean_cos = float(np.mean(proj_stats["cos"]))
+    final_acc = float(proj_stats["acc"][-1])
     print("\nPopulation-level stats (Proj run):")
-    print(f"  mean‖p − p′‖₂ = {np.mean(proj_stats['diff_L2']):.4f}")
-    print(f"  mean cos(p,p′) = {np.mean(proj_stats['cos']):.4f}")
-
+    print(f"  mean‖p − p′‖₁ = {mean_diff_l1:.4f}")
+    print(f"  mean‖p − p′‖₂ = {mean_diff_l2:.4f}")
+    print(f"  mean cos(p,p′) = {mean_cos:.4f}")
     print("\nFinal accuracy:")
-    #print(f"  SGD (p)   : {base_stats['acc'][-1]:.2f}%")
-    print(f"  ProjSGD p′: {proj_stats['acc'][-1]:.2f}%")
+    print(f"  ProjSGD p′: {final_acc:.2f}%")
+
+    history = [
+        {"epoch": i + 1, "loss": float(l), "accuracy": float(a)}
+        for i, (l, a) in enumerate(zip(proj_stats["loss"], proj_stats["acc"]))
+    ]
+    final_loss = float(proj_stats["loss"][-1]) if proj_stats["loss"] else None
+    final_metrics = {
+        "accuracy": final_acc,
+        "mean_diff_L1": mean_diff_l1,
+        "mean_diff_L2": mean_diff_l2,
+        "mean_cos": mean_cos,
+        "final_loss": final_loss,
+    }
+
+    results = save_json(
+        experiment="dp_virtual_projection",
+        params=params or {},
+        history=history,
+        final_metrics=final_metrics,
+        output_dir=output_dir,
+        filename=filename,
+    )
+    clear_memory()
+    return results
+
+# -----------------------------------------------------------------------------
+def train(
+    cfg: ExperimentConfig | None = None,
+    output_dir: str | None = None,
+    filename: str | None = None,
+):
+    """Convenience wrapper accepting a dataclass config and output directory."""
+    cfg = cfg or ExperimentConfig()
+    params = asdict(cfg)
+    return main_run(params=params, output_dir=output_dir, filename=filename)
 
 ###############################################################################
 if __name__ == "__main__":
-    main_run()
+    train(ExperimentConfig(), "outputs")
 
