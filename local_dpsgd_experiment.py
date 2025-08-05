@@ -23,6 +23,7 @@ from opacus.grad_sample import GradSampleModule
 from diffusers import ConsistencyModelPipeline            # light decoder
 import torchvision.transforms as T
 from dataclasses import dataclass, asdict, field
+from experiment_utils import save_json, clear_memory
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -695,7 +696,8 @@ def summary(model, accnt, log, name, plot: bool = False):
 def run_experiment(
     experiment: str = EXPERIMENT,
     params: dict | None = None,
-    output_path: str | None = None,
+    output_dir: str | None = None,
+    filename: str | None = None,
 ):
     """Run one of the DP-SGD experiments and optionally save metrics."""
     apply_params(params)
@@ -715,21 +717,21 @@ def run_experiment(
     else:
         raise ValueError("Unknown EXPERIMENT")
 
-    results = {
-        "experiment_name": experiment,
-        "hyperparameters": params or {},
-        "history": res["history"],
-        "final_metrics": {
-            "accuracy": res["final_accuracy"],
-            "epsilon": res["epsilon"],
-            "final_loss": res.get("final_loss"),
-        },
+    final_metrics = {
+        "accuracy": res["final_accuracy"],
+        "epsilon": res["epsilon"],
+        "final_loss": res.get("final_loss"),
     }
 
-    if output_path:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
+    results = save_json(
+        experiment=experiment,
+        params=params or {},
+        history=res["history"],
+        final_metrics=final_metrics,
+        output_dir=output_dir,
+        filename=filename,
+    )
+    clear_memory()
     return results
 
 
@@ -741,13 +743,12 @@ def train(
     """Wrapper that accepts a dataclass config and output directory."""
     cfg = cfg or ExperimentConfig()
     params = asdict(cfg)
-    path = None
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        fname = filename or f"{cfg.EXPERIMENT}_{ts}.json"
-        path = os.path.join(output_dir, fname)
-    return run_experiment(experiment=cfg.EXPERIMENT, params=params, output_path=path)
+    return run_experiment(
+        experiment=cfg.EXPERIMENT,
+        params=params,
+        output_dir=output_dir,
+        filename=filename,
+    )
 
 
 if __name__ == "__main__":

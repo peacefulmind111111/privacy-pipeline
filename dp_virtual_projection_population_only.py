@@ -13,6 +13,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, ConcatDataset, Subset
+from experiment_utils import save_json, clear_memory
 
 # Opacus
 from opacus.validators import ModuleValidator
@@ -416,17 +417,12 @@ def run_training(dp_net,
 ###############################################################################
 # 10-B. main_run
 ###############################################################################
-def main_run(params: dict | None = None, output_path: str | None = None):
-    """Run the virtual projection experiment.
-
-    Parameters
-    ----------
-    params: dict, optional
-        Hyperparameters to override at runtime.
-    output_path: str, optional
-        Where to save a JSON report of metrics. If ``None`` the report is
-        returned but not written to disk.
-    """
+def main_run(
+    params: dict | None = None,
+    output_dir: str | None = None,
+    filename: str | None = None,
+):
+    """Run the virtual projection experiment and optionally write JSON metrics."""
     apply_params(params)
     print_memory_usage("Start")
 
@@ -479,22 +475,22 @@ def main_run(params: dict | None = None, output_path: str | None = None):
         for i, (l, a) in enumerate(zip(proj_stats["loss"], proj_stats["acc"]))
     ]
     final_loss = float(proj_stats["loss"][-1]) if proj_stats["loss"] else None
-    results = {
-        "experiment_name": "dp_virtual_projection",
-        "hyperparameters": params or {},
-        "history": history,
-        "final_metrics": {
-            "accuracy": final_acc,
-            "mean_diff_L2": mean_diff,
-            "mean_cos": mean_cos,
-            "final_loss": final_loss,
-        },
+    final_metrics = {
+        "accuracy": final_acc,
+        "mean_diff_L2": mean_diff,
+        "mean_cos": mean_cos,
+        "final_loss": final_loss,
     }
 
-    if output_path:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
+    results = save_json(
+        experiment="dp_virtual_projection",
+        params=params or {},
+        history=history,
+        final_metrics=final_metrics,
+        output_dir=output_dir,
+        filename=filename,
+    )
+    clear_memory()
     return results
 
 # -----------------------------------------------------------------------------
@@ -506,13 +502,7 @@ def train(
     """Convenience wrapper accepting a dataclass config and output directory."""
     cfg = cfg or ExperimentConfig()
     params = asdict(cfg)
-    path = None
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        fname = filename or f"dp_virtual_projection_{ts}.json"
-        path = os.path.join(output_dir, fname)
-    return main_run(params=params, output_path=path)
+    return main_run(params=params, output_dir=output_dir, filename=filename)
 
 ###############################################################################
 if __name__ == "__main__":
