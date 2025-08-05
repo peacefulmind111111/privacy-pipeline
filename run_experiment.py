@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from datetime import datetime
 
 
 def main() -> None:
@@ -20,7 +21,9 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=str,
-        default=os.path.join("outputs", "metrics.json"),
+        default=os.path.join(
+            "outputs", f"metrics_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
+        ),
         help="Where to save metrics JSON",
     )
     args = parser.parse_args()
