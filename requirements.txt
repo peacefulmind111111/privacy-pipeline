@@ -12,3 +12,6 @@ streamlit==1.33.0
 
 # Notebook kernel support (needed for registering the environment as a Jupyter kernel)
 ipykernel==6.29.4
+
+# Jupyter environment for executing notebooks
+jupyter==1.1.1
