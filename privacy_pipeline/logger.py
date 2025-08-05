@@ -48,10 +48,24 @@ class ExperimentLogger:
         report = {
             "experiment_name": getattr(self.cfg, "experiment_name", "dp_experiment"),
             "timestamp": datetime.utcnow().isoformat(),
-            "hyperparameters": asdict(self.cfg),
+            "hyperparameters": _ensure_serializable(asdict(self.cfg)),
             "iterations": self.iterations,
             "final_metrics": final_metrics,
         }
         path = os.path.join(self.output_dir, "metrics.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
+
+
+def _ensure_serializable(obj: Any) -> Any:
+    """Recursively convert ``obj`` into JSON-serializable types.
+
+    Non-serializable objects are cast to ``str``.
+    """
+    if isinstance(obj, dict):
+        return {k: _ensure_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_ensure_serializable(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return str(obj)
