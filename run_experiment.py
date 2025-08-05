@@ -1,42 +1,44 @@
 import argparse
 import json
-import os
+from dataclasses import asdict
 from typing import Any, Dict
 
 
 def get_default_params(method: str) -> Dict[str, Any]:
-    """Return a copy of the default hyperparameters for an experiment."""
+    """Return default hyperparameters for an experiment."""
     if method == "dp_virtual_projection":
-        from dp_virtual_projection_population_only import DEFAULT_PARAMS
+        from dp_virtual_projection_population_only import ExperimentConfig
 
-        return DEFAULT_PARAMS.copy()
+        return asdict(ExperimentConfig())
     elif method == "local_dpsgd":
-        from local_dpsgd_experiment import DEFAULT_PARAMS
+        from local_dpsgd_experiment import ExperimentConfig
 
-        return DEFAULT_PARAMS.copy()
+        return asdict(ExperimentConfig())
     else:
         raise ValueError("Unknown method")
 
 
-def run_experiment(method: str, params: Dict[str, Any] | None = None, output: str | None = None) -> Dict[str, Any]:
+def run_experiment(
+    method: str,
+    params: Dict[str, Any] | None = None,
+    output_dir: str | None = None,
+) -> Dict[str, Any]:
     """Run the requested experiment with optional parameter overrides."""
     params = params or {}
 
     if method == "dp_virtual_projection":
-        from dp_virtual_projection_population_only import main_run
+        from dp_virtual_projection_population_only import ExperimentConfig, train
 
-        results = main_run(params=params)
+        cfg = ExperimentConfig(**params)
+        results = train(cfg, output_dir)
     elif method == "local_dpsgd":
-        from local_dpsgd_experiment import run_experiment as run_local
+        from local_dpsgd_experiment import ExperimentConfig, train
 
-        results = run_local(params=params)
+        cfg = ExperimentConfig(**params)
+        results = train(cfg, output_dir)
     else:
         raise ValueError("Unknown method")
 
-    if output:
-        os.makedirs(os.path.dirname(output), exist_ok=True)
-        with open(output, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
     return results
 
 
@@ -55,17 +57,18 @@ def main() -> None:
         help="JSON string of hyperparameters to override",
     )
     parser.add_argument(
-        "--output",
+        "--output_dir",
         type=str,
-        default=os.path.join("outputs", "metrics.json"),
-        help="Where to save metrics JSON",
+        default="outputs",
+        help="Directory to save metrics JSON",
     )
     args = parser.parse_args()
     params = json.loads(args.params)
 
-    results = run_experiment(args.method, params=params, output=args.output)
+    results = run_experiment(args.method, params=params, output_dir=args.output_dir)
     print(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":
     main()
+

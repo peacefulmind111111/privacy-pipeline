@@ -22,78 +22,64 @@ from opacus.accountants import RDPAccountant
 from opacus.grad_sample import GradSampleModule
 from diffusers import ConsistencyModelPipeline            # light decoder
 import torchvision.transforms as T
+from dataclasses import dataclass, asdict, field
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ------------------------------------------------------------------
-# 0.  Flags & debug knob
+# 0.  Hyperparameter dataclass
 # ------------------------------------------------------------------
-EXPERIMENT      = os.getenv("EXPERIMENT", "central_priv")
-PUBLIC_METHOD   = os.getenv("PUBLIC_METHOD", "mixsub").lower()     # add | mixsub
-DEBUG           = bool(int(os.getenv("DEBUG", "1")))               # 0 = silent
-FIXED_PUB = bool(int(os.getenv("FIXED_PUB", "0")))  # set 0 to keep dynamic
+
+
+@dataclass
+class ExperimentConfig:
+    EXPERIMENT: str = "central_priv"
+    PUBLIC_METHOD: str = "mixsub"  # add | mixsub
+    DEBUG: bool = True
+    FIXED_PUB: bool = False
+    SEED: int = 0
+    PRIV_BATCH: int = 512
+    PUB_BATCH: int = 500
+    NUM_EPOCHS: int = 5
+    HEARTBEAT: int = 1
+    K_LOCAL: int = 3
+    ETA_LOCAL: float = 0.025
+    LR_OUTER: float = 0.05
+    MOMENTUM_OUTER: float = 0.9
+    OUTER_LR_LOCAL: float = 1.0
+    OUTER_LR_SCAFFOLD: float = 1.0
+    C_CLIP_PRIV: float = 1.0
+    C_CLIP_PUB: float = 1.0
+    NOISE_MULT: float = 1.0
+    DELTA: float = 1e-5
+    MILESTONES: list[int] = field(default_factory=lambda: [10, 13])
+    GAMMA: float = 0.1
+    DATA_FRACTION: float = 0.2
+    SELF_AUG_FACTOR: int = 1
+
+
+DEFAULT_CONFIG = ExperimentConfig()
+for _k, _v in asdict(DEFAULT_CONFIG).items():
+    globals()[_k] = _v
 
 assert PUBLIC_METHOD in {"add", "mixsub"}, "PUBLIC_METHOD must be add|mixsub"
 
-# ------------------------------------------------------------------
-# 1.  Hyper-parameters
-# ------------------------------------------------------------------
-SEED, PRIV_BATCH, PUB_BATCH = 0, 512, 500
-NUM_EPOCHS, HEARTBEAT       = 5, 1
-
-K_LOCAL, ETA_LOCAL          = 3, 0.025
-
-# ---- learning-rates -----------------------------------------------------------
-LR_OUTER, MOMENTUM_OUTER    = 0.05, 0.9          # used by *central* DP-SGD
-OUTER_LR_LOCAL              = float(os.getenv("OUTER_LR_LOCAL", "1.0"))
-OUTER_LR_SCAFFOLD           = float(os.getenv("OUTER_LR_SCAFFOLD", "1.0"))
-
-# ---- clipping / noise ---------------------------------------------------------
-C_CLIP_PRIV                 = 1.0                                      # private
-C_CLIP_PUB                  = float(os.getenv("C_CLIP_PUB", "1.0"))    # public
-NOISE_MULT                  = 1.0
-DELTA                       = 1e-5
-
-MILESTONES, GAMMA           = [10, 13], 0.1
-DATA_FRACTION, SELF_AUG_FACTOR = 0.2, 1
-DEVICE                      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 α_SCALE = PUB_BATCH / (PRIV_BATCH + PUB_BATCH)   # factor for mix-subtract
 
-# Defaults exposed for notebook parameter overrides
-DEFAULT_PARAMS = {
-    "EXPERIMENT": EXPERIMENT,
-    "PUBLIC_METHOD": PUBLIC_METHOD,
-    "DEBUG": DEBUG,
-    "FIXED_PUB": FIXED_PUB,
-    "SEED": SEED,
-    "PRIV_BATCH": PRIV_BATCH,
-    "PUB_BATCH": PUB_BATCH,
-    "NUM_EPOCHS": NUM_EPOCHS,
-    "HEARTBEAT": HEARTBEAT,
-    "K_LOCAL": K_LOCAL,
-    "ETA_LOCAL": ETA_LOCAL,
-    "LR_OUTER": LR_OUTER,
-    "MOMENTUM_OUTER": MOMENTUM_OUTER,
-    "OUTER_LR_LOCAL": OUTER_LR_LOCAL,
-    "OUTER_LR_SCAFFOLD": OUTER_LR_SCAFFOLD,
-    "C_CLIP_PRIV": C_CLIP_PRIV,
-    "C_CLIP_PUB": C_CLIP_PUB,
-    "NOISE_MULT": NOISE_MULT,
-    "DELTA": DELTA,
-    "MILESTONES": MILESTONES,
-    "GAMMA": GAMMA,
-    "DATA_FRACTION": DATA_FRACTION,
-    "SELF_AUG_FACTOR": SELF_AUG_FACTOR,
-}
 
-def apply_params(params: dict | None) -> None:
+def apply_params(params: dict | ExperimentConfig | None) -> None:
     """Override global hyperparameters using ``params``."""
     if not params:
         return
+    if isinstance(params, ExperimentConfig):
+        params = asdict(params)
     for k, v in params.items():
         if k in globals():
             globals()[k] = v
+
+
+DEFAULT_PARAMS = asdict(DEFAULT_CONFIG)
 
 # ------------------------------------------------------------------
 # 2.  RNG
@@ -698,9 +684,11 @@ def summary(model, accnt, log, name, plot: bool = False):
         {"step": s, "accuracy": a}
         for s, a in zip(log.get("acc_step", []), log.get("acc", []))
     ]
+    final_loss = float(log["loss"][-1]) if log.get("loss") else None
     return {
         "final_accuracy": float(final_acc),
         "epsilon": float(eps),
+        "final_loss": final_loss,
         "history": history,
     }
 
@@ -734,6 +722,7 @@ def run_experiment(
         "final_metrics": {
             "accuracy": res["final_accuracy"],
             "epsilon": res["epsilon"],
+            "final_loss": res.get("final_loss"),
         },
     }
 
@@ -744,8 +733,24 @@ def run_experiment(
     return results
 
 
+def train(
+    cfg: ExperimentConfig | None = None,
+    output_dir: str | None = None,
+    filename: str | None = None,
+):
+    """Wrapper that accepts a dataclass config and output directory."""
+    cfg = cfg or ExperimentConfig()
+    params = asdict(cfg)
+    path = None
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        fname = filename or f"{cfg.EXPERIMENT}_{ts}.json"
+        path = os.path.join(output_dir, fname)
+    return run_experiment(experiment=cfg.EXPERIMENT, params=params, output_path=path)
+
+
 if __name__ == "__main__":
-    output = os.getenv("OUTPUT", os.path.join("outputs", "local_dpsgd.json"))
-    res = run_experiment(EXPERIMENT, output_path=output)
+    res = train(ExperimentConfig(), os.getenv("OUTPUT_DIR", "outputs"))
     print(json.dumps(res, indent=2))
 

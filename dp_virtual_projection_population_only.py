@@ -10,6 +10,7 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import OrderedDict
+from dataclasses import dataclass, asdict
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, ConcatDataset, Subset
 
@@ -18,74 +19,60 @@ from opacus.validators import ModuleValidator
 from opacus.grad_sample import GradSampleModule
 
 ###############################################################################
-# 0. Hyperparameters
+# 0. Hyperparameter dataclass
 ###############################################################################
-seed                 = 0
-random.seed(seed);  torch.manual_seed(seed);  np.random.seed(seed)
-
-batch_size           = 1000
-lr                   = 0.1
-outer_momentum       = 0.9
-inner_momentum       = 0.0
-noise_mult           = 0.0          # no DP noise in this script
-delta                = 1e-5
-num_epochs           = 10            # ← raise above warm_start_epochs for real runs
-M                    = 0             # momentum dictionary capacity
-self_aug_factor      = 1
-
-# --- Projection experiment knobs --------------------------------------------
-warm_start_epochs     = 2           # plain-SGD epochs before any projection
-proj_lr_multiplier    = 3.0         # bump LR when projection begins
-scale_pprime_to_pL2   = True       # re-norm p′ so ‖p′‖₂ = ‖p‖₂
-trust_mix_alpha       = 1           # 0→raw p ; 1→pure p′
-rebuild_basis_every   = 3           # epochs; 0→never rebuild
-# -----------------------------------------------------------------------------
 
 
-# -- Virtual-sample parameters --
-subsets_per_class      = 25
-subset_size            = 200
-virtual_augment_factor = 10
+@dataclass
+class ExperimentConfig:
+    seed: int = 0
+    batch_size: int = 1000
+    lr: float = 0.1
+    outer_momentum: float = 0.9
+    inner_momentum: float = 0.0
+    noise_mult: float = 0.0  # no DP noise in this script
+    delta: float = 1e-5
+    num_epochs: int = 10  # ← raise above warm_start_epochs for real runs
+    M: int = 0  # momentum dictionary capacity
+    self_aug_factor: int = 1
+    # Projection experiment knobs
+    warm_start_epochs: int = 2  # plain-SGD epochs before any projection
+    proj_lr_multiplier: float = 3.0  # bump LR when projection begins
+    scale_pprime_to_pL2: bool = True  # re-norm p′ so ‖p′‖₂ = ‖p‖₂
+    trust_mix_alpha: float = 1.0  # 0→raw p ; 1→pure p′
+    rebuild_basis_every: int = 3  # epochs; 0→never rebuild
+    # Virtual-sample parameters
+    subsets_per_class: int = 25
+    subset_size: int = 200
+    virtual_augment_factor: int = 10
+    # “No-clipping” setup (huge C so clipping never triggers)
+    c_start: float = 1e9
+    c_end: float = 1e9
 
-# -- “No-clipping” setup (huge C so clipping never triggers)
-c_start = 1e9;  c_end = 1e9
+
+DEFAULT_CONFIG = ExperimentConfig()
+for _k, _v in asdict(DEFAULT_CONFIG).items():
+    globals()[_k] = _v
+
+random.seed(seed)
+torch.manual_seed(seed)
+np.random.seed(seed)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Expose defaults for notebook-friendly overrides
-DEFAULT_PARAMS = {
-    "seed": seed,
-    "batch_size": batch_size,
-    "lr": lr,
-    "outer_momentum": outer_momentum,
-    "inner_momentum": inner_momentum,
-    "noise_mult": noise_mult,
-    "delta": delta,
-    "num_epochs": num_epochs,
-    "M": M,
-    "self_aug_factor": self_aug_factor,
-    # Projection experiment knobs
-    "warm_start_epochs": warm_start_epochs,
-    "proj_lr_multiplier": proj_lr_multiplier,
-    "scale_pprime_to_pL2": scale_pprime_to_pL2,
-    "trust_mix_alpha": trust_mix_alpha,
-    "rebuild_basis_every": rebuild_basis_every,
-    # Virtual-sample parameters
-    "subsets_per_class": subsets_per_class,
-    "subset_size": subset_size,
-    "virtual_augment_factor": virtual_augment_factor,
-    # Clipping setup
-    "c_start": c_start,
-    "c_end": c_end,
-}
 
-def apply_params(params: dict | None) -> None:
+def apply_params(params: dict | ExperimentConfig | None) -> None:
     """Override module-level hyperparameters with ``params``."""
     if not params:
         return
+    if isinstance(params, ExperimentConfig):
+        params = asdict(params)
     for k, v in params.items():
         if k in globals():
             globals()[k] = v
+
+
+DEFAULT_PARAMS = asdict(DEFAULT_CONFIG)
 
 ###############################################################################
 # 0.1 Memory helper
@@ -491,6 +478,7 @@ def main_run(params: dict | None = None, output_path: str | None = None):
         {"epoch": i + 1, "loss": float(l), "accuracy": float(a)}
         for i, (l, a) in enumerate(zip(proj_stats["loss"], proj_stats["acc"]))
     ]
+    final_loss = float(proj_stats["loss"][-1]) if proj_stats["loss"] else None
     results = {
         "experiment_name": "dp_virtual_projection",
         "hyperparameters": params or {},
@@ -499,6 +487,7 @@ def main_run(params: dict | None = None, output_path: str | None = None):
             "accuracy": final_acc,
             "mean_diff_L2": mean_diff,
             "mean_cos": mean_cos,
+            "final_loss": final_loss,
         },
     }
 
@@ -508,7 +497,24 @@ def main_run(params: dict | None = None, output_path: str | None = None):
             json.dump(results, f, indent=2)
     return results
 
+# -----------------------------------------------------------------------------
+def train(
+    cfg: ExperimentConfig | None = None,
+    output_dir: str | None = None,
+    filename: str | None = None,
+):
+    """Convenience wrapper accepting a dataclass config and output directory."""
+    cfg = cfg or ExperimentConfig()
+    params = asdict(cfg)
+    path = None
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        fname = filename or f"dp_virtual_projection_{ts}.json"
+        path = os.path.join(output_dir, fname)
+    return main_run(params=params, output_path=path)
+
 ###############################################################################
 if __name__ == "__main__":
-    main_run(output_path=os.path.join("outputs", "dp_virtual_projection.json"))
+    train(ExperimentConfig(), "outputs")
 
