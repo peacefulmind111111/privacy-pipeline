@@ -61,19 +61,20 @@ np.random.seed(seed)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
 def apply_params(params: dict | ExperimentConfig | None) -> None:
     """Override module-level hyperparameters with ``params``."""
     if not params:
         return
     if isinstance(params, ExperimentConfig):
         params = asdict(params)
+
     for k, v in params.items():
         if k in globals():
             globals()[k] = v
 
 
 DEFAULT_PARAMS = asdict(DEFAULT_CONFIG)
+
 
 ###############################################################################
 # 0.1 Memory helper
@@ -417,12 +418,14 @@ def run_training(dp_net,
 ###############################################################################
 # 10-B. main_run
 ###############################################################################
+
 def main_run(
     params: dict | None = None,
     output_dir: str | None = None,
     filename: str | None = None,
 ):
     """Run the virtual projection experiment and optionally write JSON metrics."""
+
     apply_params(params)
     print_memory_usage("Start")
 
@@ -474,6 +477,7 @@ def main_run(
         {"epoch": i + 1, "loss": float(l), "accuracy": float(a)}
         for i, (l, a) in enumerate(zip(proj_stats["loss"], proj_stats["acc"]))
     ]
+
     final_loss = float(proj_stats["loss"][-1]) if proj_stats["loss"] else None
     final_metrics = {
         "accuracy": final_acc,
@@ -507,4 +511,5 @@ def train(
 ###############################################################################
 if __name__ == "__main__":
     train(ExperimentConfig(), "outputs")
+
 

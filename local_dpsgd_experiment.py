@@ -82,6 +82,14 @@ def apply_params(params: dict | ExperimentConfig | None) -> None:
 
 DEFAULT_PARAMS = asdict(DEFAULT_CONFIG)
 
+def apply_params(params: dict | None) -> None:
+    """Override global hyperparameters using ``params``."""
+    if not params:
+        return
+    for k, v in params.items():
+        if k in globals():
+            globals()[k] = v
+
 # ------------------------------------------------------------------
 # 2.  RNG
 # ------------------------------------------------------------------
@@ -685,20 +693,22 @@ def summary(model, accnt, log, name, plot: bool = False):
         {"step": s, "accuracy": a}
         for s, a in zip(log.get("acc_step", []), log.get("acc", []))
     ]
+
     final_loss = float(log["loss"][-1]) if log.get("loss") else None
     return {
         "final_accuracy": float(final_acc),
         "epsilon": float(eps),
         "final_loss": final_loss,
-        "history": history,
+
     }
 
 def run_experiment(
     experiment: str = EXPERIMENT,
     params: dict | None = None,
+
     output_dir: str | None = None,
     filename: str | None = None,
-):
+
     """Run one of the DP-SGD experiments and optionally save metrics."""
     apply_params(params)
 
@@ -753,5 +763,6 @@ def train(
 
 if __name__ == "__main__":
     res = train(ExperimentConfig(), os.getenv("OUTPUT_DIR", "outputs"))
+
     print(json.dumps(res, indent=2))
 
