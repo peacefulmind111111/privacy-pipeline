@@ -36,6 +36,24 @@ def clip_sum_noise(
     return final_grad, None
 
 
+def clip_sum_noise_per_sample(
+    vecs: Sequence[torch.Tensor],
+    clip_vals: Sequence[float],
+    noise_mult: float,
+    do_noise: bool = True,
+) -> torch.Tensor:
+    """Single-sum clipping with per-sample clip values and optional noise."""
+    grad_sum = torch.stack(list(vecs), dim=0).sum(dim=0)
+    total_clip = float(sum(clip_vals))
+    norm_ = grad_sum.norm(2)
+    if norm_ > total_clip:
+        grad_sum = grad_sum * (total_clip / (norm_ + 1e-9))
+    if do_noise and clip_vals:
+        cmax = max(clip_vals)
+        grad_sum += torch.randn_like(grad_sum) * (noise_mult * cmax)
+    return grad_sum / float(len(clip_vals))
+
+
 def outer_step(dp_model: torch.nn.Module, optimizer, final_grad: torch.Tensor) -> None:
     idx_start = 0
     for p in dp_model.parameters():

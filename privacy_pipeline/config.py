@@ -25,6 +25,12 @@ class ExperimentConfig:
     c_start: float = 4.0
     c_end: float = 2.0
 
+    # outlier clipping
+    default_clip: float = 1.0
+    outlier_clip: float = 0.5
+    high_err_threshold: float = 0.95
+    drop_after_frac: float = 0.6
+
     # dataset and augmentation
     self_aug_factor: int = 3
     dataset_mean: Tuple[float, float, float] = field(
